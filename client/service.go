@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fatedier/golib/crypto"
@@ -32,6 +33,7 @@ import (
 	"github.com/fatedier/frp/pkg/config"
 	"github.com/fatedier/frp/pkg/config/source"
 	v1 "github.com/fatedier/frp/pkg/config/v1"
+	"github.com/fatedier/frp/pkg/config/v1/validation"
 	"github.com/fatedier/frp/pkg/msg"
 	"github.com/fatedier/frp/pkg/policy/security"
 	httppkg "github.com/fatedier/frp/pkg/util/http"
@@ -109,6 +111,9 @@ func setServiceOptionsDefault(options *ServiceOptions) error {
 // Service is the client service that connects to frps and provides proxy services.
 type Service struct {
 	ctlMu sync.RWMutex
+	// Stores gracefulShutdownDuration independently from ctlMu, because the
+	// graceful shutdown wait may hold ctlMu for an arbitrary duration.
+	gracefulShutdownDuration atomic.Int64
 	// manager control connection with server
 	ctl *Control
 	// Uniq id got from frps, it will be attached to loginMsg.
@@ -148,16 +153,16 @@ type Service struct {
 
 	// service context
 	ctx context.Context
-	// call cancel to stop service. Guarded by ctlMu together with closed and
-	// gracefulShutdownDuration: the SSH tunnel server (pkg/ssh) runs Run and
-	// Close on different goroutines, so Close may fire before Run has
-	// assigned cancel.
-	cancel context.CancelCauseFunc
+	// call cancel to stop service. Guarded by cancelMu together with closed:
+	// the SSH tunnel server (pkg/ssh) runs Run and Close on different
+	// goroutines, so Close may fire before Run has assigned cancel. Not ctlMu,
+	// because stop() holds ctlMu during the graceful shutdown wait.
+	cancelMu sync.Mutex
+	cancel   context.CancelCauseFunc
 	// closed records a Close/GracefulClose that arrived before Run assigned
 	// cancel; Run checks it and shuts down immediately instead of running a
 	// closed service.
-	closed                   bool
-	gracefulShutdownDuration time.Duration
+	closed bool
 
 	connectorCreator func(context.Context, *v1.ClientCommonConfig) Connector
 	handleWorkConnCb func(*v1.ProxyBaseConfig, net.Conn, *msg.StartWorkConn) bool
@@ -229,10 +234,10 @@ func NewService(options ServiceOptions) (*Service, error) {
 func (svr *Service) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancelCause(ctx)
 	svr.ctx = xlog.NewContext(ctx, xlog.FromContextSafe(ctx))
-	svr.ctlMu.Lock()
+	svr.cancelMu.Lock()
 	svr.cancel = cancel
 	closed := svr.closed
-	svr.ctlMu.Unlock()
+	svr.cancelMu.Unlock()
 	if closed {
 		// Close raced ahead of Run; honor it instead of running a closed service.
 		cancel(nil)
@@ -440,11 +445,11 @@ func (svr *Service) Close() {
 }
 
 func (svr *Service) GracefulClose(d time.Duration) {
-	svr.ctlMu.Lock()
-	svr.gracefulShutdownDuration = d
+	svr.gracefulShutdownDuration.Store(int64(d))
+	svr.cancelMu.Lock()
 	svr.closed = true
 	cancel := svr.cancel
-	svr.ctlMu.Unlock()
+	svr.cancelMu.Unlock()
 	// cancel is nil until Run assigns it; in that case closed makes Run shut
 	// down as soon as it starts.
 	if cancel != nil {
@@ -465,7 +470,8 @@ func (svr *Service) stop() {
 	svr.ctlMu.Lock()
 	defer svr.ctlMu.Unlock()
 	if svr.ctl != nil {
-		svr.ctl.GracefulClose(svr.gracefulShutdownDuration)
+		d := time.Duration(svr.gracefulShutdownDuration.Load())
+		svr.ctl.GracefulClose(d)
 		svr.ctl = nil
 	}
 	if svr.webServer != nil {
@@ -542,6 +548,13 @@ func (svr *Service) reloadConfigFromSourcesLocked() error {
 	proxies, visitors = config.FilterClientConfigurers(reloadCommon, proxies, visitors)
 	proxies = config.CompleteProxyConfigurers(proxies)
 	visitors = config.CompleteVisitorConfigurers(visitors)
+	requirements := validation.GetClientConfigRequirements(reloadCommon, proxies, visitors)
+	if svr.vnetController == nil && requirements.VirtualNet {
+		return errors.New(
+			"VirtualNet-dependent configuration requires a VirtualNet runtime enabled at startup; " +
+				"restart frpc after configuring featureGates.VirtualNet and virtualNet.address",
+		)
+	}
 
 	// Atomically replace the entire configuration
 	if err := svr.UpdateAllConfigurer(proxies, visitors); err != nil {
