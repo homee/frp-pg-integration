@@ -209,6 +209,9 @@ type SSHTunnelGateway struct {
 	AutoGenPrivateKeyPath string                  `json:"autoGenPrivateKeyPath,omitempty"`
 	AuthorizedKeysFile    string                  `json:"authorizedKeysFile,omitempty"`
 	AuthorizedKeysDB      *AuthorizedKeysDBConfig `json:"authorizedKeysDB,omitempty"`
+	// AuthorizedKeysDynamoDB is the DynamoDB alternative to AuthorizedKeysDB.
+	// At most one of the two may be set.
+	AuthorizedKeysDynamoDB *AuthorizedKeysDynamoDBConfig `json:"authorizedKeysDynamoDB,omitempty"`
 	// HeartbeatInterval specifies the interval in seconds at which the server
 	// checks that a tunnel client is still there, like sshd's
 	// ClientAliveInterval. By default, this value is 30.
@@ -237,6 +240,21 @@ type AuthorizedKeysDBConfig struct {
 	LookupQuery    string `json:"lookupQuery,omitempty"`
 	MaxConns       int32  `json:"maxConns,omitempty"`
 	QueryTimeoutMs int    `json:"queryTimeoutMs,omitempty"`
+}
+
+// AuthorizedKeysDynamoDBConfig configures a DynamoDB-backed lookup for SSH
+// authorized keys. Each item must carry the OpenSSH public key in a "pub"
+// string attribute and the username in a "mac" string attribute.
+//
+// The whole table is held in memory and refreshed every
+// RefreshIntervalSeconds (default 600), and at most once a minute when an
+// unknown key shows up, so a newly registered key is accepted within about
+// a minute. Credentials and, if Region is empty, the region come from the
+// default AWS chain (instance role, AWS_* env vars, shared config).
+type AuthorizedKeysDynamoDBConfig struct {
+	Table                  string `json:"table,omitempty"`
+	Region                 string `json:"region,omitempty"`
+	RefreshIntervalSeconds int    `json:"refreshIntervalSeconds,omitempty"`
 }
 
 func (c *SSHTunnelGateway) Complete() {

@@ -31,6 +31,13 @@ import (
 	netpkg "github.com/fatedier/frp/pkg/util/net"
 )
 
+// KeyLookup is an authorized-keys backend: Postgres (AuthorizedKeysDB) or
+// DynamoDB (AuthorizedKeysDynamo).
+type KeyLookup interface {
+	LookupUser(ctx context.Context, pubKeyBlob []byte) (user string, found bool, err error)
+	Close()
+}
+
 type Gateway struct {
 	bindPort int
 	ln       net.Listener
@@ -38,7 +45,7 @@ type Gateway struct {
 	peerServerListener *netpkg.InternalListener
 
 	sshConfig *ssh.ServerConfig
-	authDB    *AuthorizedKeysDB
+	authDB    KeyLookup
 
 	heartbeatInterval time.Duration
 	heartbeatCountMax int64
@@ -77,20 +84,22 @@ func NewGateway(
 	}
 	sshConfig.AddHostKey(privateKey)
 
-	dbConfigured := cfg.AuthorizedKeysDB != nil && cfg.AuthorizedKeysDB.DSN != ""
-	sshConfig.NoClientAuth = !dbConfigured && cfg.AuthorizedKeysFile == ""
-
-	var authDB *AuthorizedKeysDB
-	if dbConfigured {
+	var authDB KeyLookup
+	switch {
+	case cfg.AuthorizedKeysDB != nil && cfg.AuthorizedKeysDB.DSN != "":
 		authDB, err = NewAuthorizedKeysDB(context.Background(), *cfg.AuthorizedKeysDB)
-		if err != nil {
-			return nil, fmt.Errorf("init authorized keys db: %w", err)
-		}
+	case cfg.AuthorizedKeysDynamoDB != nil:
+		authDB, err = NewAuthorizedKeysDynamo(context.Background(), *cfg.AuthorizedKeysDynamoDB)
 	}
+	if err != nil {
+		return nil, fmt.Errorf("init authorized keys db: %w", err)
+	}
+	sshConfig.NoClientAuth = authDB == nil && cfg.AuthorizedKeysFile == ""
 
 	sshConfig.PublicKeyCallback = func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 		if authDB != nil {
-			// Look up by the marshaled public key blob (BYTEA in Postgres).
+			// Look up by the marshaled public key blob (BYTEA in Postgres,
+			// map key in the DynamoDB snapshot).
 			// Alternative: pass ssh.FingerprintSHA256(key) instead — the DB
 			// then stores a "SHA256:..." string keyed column. Both work; raw
 			// bytes is more direct, fingerprint is friendlier to log/audit.

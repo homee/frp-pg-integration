@@ -70,5 +70,17 @@ func (v *ConfigValidator) ValidateServerConfig(c *v1.ServerConfig) (Warning, err
 		}
 	}
 
+	if ddb := c.SSHTunnelGateway.AuthorizedKeysDynamoDB; ddb != nil {
+		if ddb.Table == "" {
+			errs = AppendError(errs, fmt.Errorf("sshTunnelGateway.authorizedKeysDynamoDB.table is required when authorizedKeysDynamoDB is set"))
+		}
+		if ddb.RefreshIntervalSeconds < 0 {
+			errs = AppendError(errs, fmt.Errorf("sshTunnelGateway.authorizedKeysDynamoDB.refreshIntervalSeconds must be non-negative"))
+		}
+		if c.SSHTunnelGateway.AuthorizedKeysDB != nil {
+			errs = AppendError(errs, fmt.Errorf("sshTunnelGateway: set only one of authorizedKeysDB and authorizedKeysDynamoDB"))
+		}
+	}
+
 	return warnings, errs
 }
